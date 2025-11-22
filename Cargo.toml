@@ -1,0 +1,22 @@
+[package]
+name = "readme_updater"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# For async runtime
+tokio = { version = "1", features = ["full"] }
+# For HTTP requests to Ollama
+# We use rustls-tls to avoid OpenSSL issues
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+# For file system watching
+notify = "6.1"
+# For JSON handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# For easier error handling
+anyhow = "1.0"
+# For non-blocking synchronization
+crossbeam-channel = "0.5"
+# For timestamps
+chrono = "0.4"

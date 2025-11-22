@@ -1,0 +1,3 @@
+Run this inside the git repository you want to track:
+```bash
+cargo run --release
