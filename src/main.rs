@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 const CACHE_FILE: &str = ".file_watcher_cache.json";
@@ -102,7 +103,7 @@ fn normalize_path(path: &Path) -> String {
 }
 
 fn initialize_cache() -> Cache {
-    println!("🔄 Initializing cache with current file state...");
+    println!("📄 Initializing cache with current file state...");
     let mut cache = Cache::default();
     
     for file_path in get_tracked_files() {
@@ -149,7 +150,17 @@ fn calculate_diff(old_content: &str, new_content: &str) -> String {
     diff_output
 }
 
-fn process_changes(cache: &mut Cache, paths: &HashSet<PathBuf>) {
+fn process_changes(cache: &mut Cache, paths: &HashSet<PathBuf>, processing: Arc<Mutex<bool>>) {
+    // Check if already processing
+    {
+        let mut is_processing = processing.lock().unwrap();
+        if *is_processing {
+            println!("⏸️  Already processing changes, skipping...");
+            return;
+        }
+        *is_processing = true;
+    }
+
     let mut diff_content = String::new();
 
     for path in paths {
@@ -159,10 +170,10 @@ fn process_changes(cache: &mut Cache, paths: &HashSet<PathBuf>) {
             println!("🔍 Checking file: {}", path_str);
             
             if let Some(snapshot) = cache.get_snapshot(&path_str) {
-                println!("🔍 Cached content length: {}", snapshot.content.len());
-                println!("🔍 New content length: {}", new_content.len());
+                println!("📋 Cached content length: {}", snapshot.content.len());
+                println!("📋 New content length: {}", new_content.len());
             } else {
-                println!("🔍 No snapshot found in cache!");
+                println!("📋 No snapshot found in cache!");
             }
             
             let filtered_diff = if let Some(snapshot) = cache.get_snapshot(&path_str) {
@@ -200,22 +211,21 @@ fn process_changes(cache: &mut Cache, paths: &HashSet<PathBuf>) {
     } else {
         println!("ℹ️  No actual changes detected after filtering.");
     }
+
+    // Release processing lock
+    {
+        let mut is_processing = processing.lock().unwrap();
+        *is_processing = false;
+    }
 }
 
-// I think there may still be a disconect between what is sent according to the debug printout and what the llm is summarizing
 #[tokio::main]
 async fn send_to_llm_and_update_readme(diff_content: &str, cache: &mut Cache) {
     let client = reqwest::Client::new();
 
+    // Much simpler, more direct prompt. We may need to experiment with this.
     let prompt = format!(
-        "You are an automated technical writer maintaining a project's README. \
-        You will receive a git diff of recent changes. \
-        Your job is to write a concise, engaging log entry for these changes. \
-        1. Use Markdown. \
-        2. Use emojis to categorize changes (e.g., 🐛 for bugs, ✨ for features, ⚡ for perf). \
-        3. Include short code snippets in backticks ` `if relevant. \
-        4. Do NOT write introductions like 'Here is the summary'. Just write the content.\n\n\
-        Here is the diff:\n{}",
+        "Summarize these code changes in 1-2 sentences with an emoji:\n\n{}",
         diff_content
     );
 
@@ -223,20 +233,19 @@ async fn send_to_llm_and_update_readme(diff_content: &str, cache: &mut Cache) {
         "model": "qwen2.5-coder:1.5b",
         "prompt": prompt,
         "stream": false,
+        "context": [], //don't want previous conversation context
         "options": {
-            "num_ctx": 2048,
-            "temperature": 0.7,
-            "num_predict": 100
+            "num_ctx": 1024,
+            "temperature": 0.3,
+            "num_predict": 50
         }
     });
 
-    println!(
-        "🧠 Sending diff ({} bytes) to Ollama...",
-        diff_content.len()
-    );
+    println!("🧠 Sending diff ({} bytes) to Ollama...", diff_content.len());
 
     match client
         .post("http://localhost:11434/api/generate")
+        .timeout(Duration::from_secs(30))  // Add timeout
         .json(&payload)
         .send()
         .await
@@ -244,7 +253,7 @@ async fn send_to_llm_and_update_readme(diff_content: &str, cache: &mut Cache) {
         Ok(response) => {
             if let Ok(json) = response.json::<serde_json::Value>().await {
                 if let Some(message_content) = json["response"].as_str() {
-                    println!("🔍 LLM Response: {}", message_content);
+                    println!("📝 LLM Response: {}", message_content);
                     append_to_readme(message_content);
                     cache.save();
                     println!("✅ README updated successfully!");
@@ -292,6 +301,7 @@ fn main() {
     let mut pending_changes: HashSet<PathBuf> = HashSet::new();
     let mut last_event_time = SystemTime::now();
     let debounce_duration = Duration::from_secs(4);
+    let processing = Arc::new(Mutex::new(false));
 
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
@@ -315,7 +325,7 @@ fn main() {
                     if let Ok(elapsed) = last_event_time.elapsed() {
                         if elapsed >= debounce_duration {
                             println!("⏳ Debounce finished. Calculating diffs...");
-                            process_changes(&mut cache, &pending_changes);
+                            process_changes(&mut cache, &pending_changes, Arc::clone(&processing));
                             pending_changes.clear();
                         }
                     }
