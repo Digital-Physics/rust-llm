@@ -1,174 +1,327 @@
-use anyhow::{Context, Result};
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use reqwest::Client;
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::Path;
-use std::process::Command;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
-use std::time::{Duration, Instant};
-use tokio::time::sleep;
+use std::time::{Duration, SystemTime};
 
-// Configuration
-const OLLAMA_URL: &str = "http://127.0.0.1:11434/api/chat";
-const MODEL_NAME: &str = "qwen2.5-coder:7b";
-const DEBOUNCE_DURATION: u64 = 2; // Seconds to wait for silence before processing
+const CACHE_FILE: &str = ".file_watcher_cache.json";
 
-#[derive(Serialize)]
-struct ChatMessage {
-    role: String,
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct FileSnapshot {
     content: String,
+    modified: SystemTime,
 }
 
-#[derive(Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    stream: bool,
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct Cache {
+    snapshots: HashMap<String, FileSnapshot>,
 }
 
-#[derive(Deserialize)]
-struct ChatResponse {
-    message: ChatMessageContent,
+impl Cache {
+    fn save(&self) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = fs::write(CACHE_FILE, json);
+        }
+    }
+
+    fn update_snapshot(&mut self, path: &str, content: String, modified: SystemTime) {
+        self.snapshots.insert(
+            path.to_string(),
+            FileSnapshot { content, modified },
+        );
+    }
+
+    fn get_snapshot(&self, path: &str) -> Option<&FileSnapshot> {
+        self.snapshots.get(path)
+    }
 }
 
-#[derive(Deserialize)]
-struct ChatMessageContent {
-    content: String,
+fn should_ignore(path: &Path) -> bool {
+    let ignore_list = [
+        "target",
+        ".git",
+        "node_modules",
+        ".cache",
+        CACHE_FILE,
+        "README.md",
+    ];
+
+    path.components().any(|c| {
+        if let Some(s) = c.as_os_str().to_str() {
+            ignore_list.contains(&s)
+        } else {
+            false
+        }
+    })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    println!("🚀 Starting README Updater...");
-    println!("📡 Connecting to Ollama at {} with model {}", OLLAMA_URL, MODEL_NAME);
-    println!("👀 Watching current directory for changes...");
+fn get_tracked_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(".") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !should_ignore(&path) {
+                if path.is_file() {
+                    files.push(path);
+                } else if path.is_dir() {
+                    collect_files_recursive(&path, &mut files);
+                }
+            }
+        }
+    }
+    files
+}
 
-    // 1. Setup File Watcher
-    // We use a channel to communicate between the watcher thread and our main loop
-    let (tx, rx) = channel();
+fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !should_ignore(&path) {
+                if path.is_file() {
+                    files.push(path);
+                } else if path.is_dir() {
+                    collect_files_recursive(&path, files);
+                }
+            }
+        }
+    }
+}
+
+// Helper function to normalize paths to relative format
+fn normalize_path(path: &Path) -> String {
+    if path.is_absolute() {
+        if let Ok(current_dir) = std::env::current_dir() {
+            if let Ok(rel_path) = path.strip_prefix(&current_dir) {
+                return format!("./{}", rel_path.to_string_lossy());
+            }
+        }
+    }
+    path.to_string_lossy().to_string()
+}
+
+fn initialize_cache() -> Cache {
+    println!("🔄 Initializing cache with current file state...");
+    let mut cache = Cache::default();
     
-    // Initialize the watcher
-    let mut watcher = RecommendedWatcher::new(tx, Config::default())
-        .context("Failed to create file watcher")?;
+    for file_path in get_tracked_files() {
+        if let Ok(content) = fs::read_to_string(&file_path) {
+            if let Ok(metadata) = fs::metadata(&file_path) {
+                if let Ok(modified) = metadata.modified() {
+                    let path_str = normalize_path(&file_path);
+                    cache.update_snapshot(&path_str, content.clone(), modified);
+                    println!("📸 Cached: {} ({} bytes)", path_str, content.len());
+                }
+            }
+        }
+    }
+    
+    cache.save();
+    println!("✅ Cache initialized with current state (baseline set).");
+    cache
+}
 
-    // Watch the current directory recursively
-    watcher.watch(Path::new("."), RecursiveMode::Recursive)
-        .context("Failed to watch directory")?;
+fn calculate_diff(old_content: &str, new_content: &str) -> String {
+    let old_lines: Vec<&str> = old_content.lines().collect();
+    let new_lines: Vec<&str> = new_content.lines().collect();
 
-    let client = Client::new();
-    let mut last_event_time = Instant::now();
-    let mut needs_processing = false;
+    // Build a set of old lines for quick lookup
+    let old_set: std::collections::HashSet<&str> = old_lines.iter().copied().collect();
+    let new_set: std::collections::HashSet<&str> = new_lines.iter().copied().collect();
 
-    // 2. Main Event Loop
-    // We poll for events and implement manual debouncing
-    loop {
-        // Check for new filesystem events
-        // We use try_recv to not block, so we can handle the timeout logic below
-        while let Ok(res) = rx.try_recv() {
-            match res {
-                Ok(event) => {
-                    // Filter out events for .git folder and README.md to avoid loops
-                    let should_ignore = event.paths.iter().any(|p| {
-                        let s = p.to_string_lossy();
-                        s.contains(".git") || s.ends_with("README.md")
-                    });
+    let mut diff_output = String::new();
 
-                    if !should_ignore {
-                        println!("📝 Change detected: {:?}", event.kind);
-                        last_event_time = Instant::now();
-                        needs_processing = true;
+    // Find lines that were removed (in old but not in new)
+    for line in &old_lines {
+        if !new_set.contains(line) {
+            diff_output.push_str(&format!("-{}\n", line));
+        }
+    }
+
+    // Find lines that were added (in new but not in old)
+    for line in &new_lines {
+        if !old_set.contains(line) {
+            diff_output.push_str(&format!("+{}\n", line));
+        }
+    }
+
+    diff_output
+}
+
+fn process_changes(cache: &mut Cache, paths: &HashSet<PathBuf>) {
+    let mut diff_content = String::new();
+
+    for path in paths {
+        let path_str = normalize_path(path);
+
+        if let Ok(new_content) = fs::read_to_string(path) {
+            println!("🔍 Checking file: {}", path_str);
+            
+            if let Some(snapshot) = cache.get_snapshot(&path_str) {
+                println!("🔍 Cached content length: {}", snapshot.content.len());
+                println!("🔍 New content length: {}", new_content.len());
+            } else {
+                println!("🔍 No snapshot found in cache!");
+            }
+            
+            let filtered_diff = if let Some(snapshot) = cache.get_snapshot(&path_str) {
+                calculate_diff(&snapshot.content, &new_content)
+            } else {
+                // New file - show all lines as additions
+                new_content.lines()
+                    .map(|line| format!("+{}", line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+
+            if !filtered_diff.trim().is_empty() {
+                diff_content.push_str(&format!("File: {:?}\n", path_str));
+                diff_content.push_str(&filtered_diff);
+                diff_content.push_str("\n");
+
+                // Update cache
+                if let Ok(metadata) = fs::metadata(path) {
+                    if let Ok(modified) = metadata.modified() {
+                        cache.update_snapshot(&path_str, new_content, modified);
                     }
                 }
-                Err(e) => println!("⚠️ Watch error: {:?}", e),
             }
         }
+    }
 
-        // Debounce logic:
-        // If we have pending changes AND enough time has passed since the last event...
-        if needs_processing && last_event_time.elapsed() > Duration::from_secs(DEBOUNCE_DURATION) {
-            println!("⏳ Debounce finished. Analyzing changes...");
-            
-            // Reset state immediately
-            needs_processing = false; 
+    if !diff_content.trim().is_empty() {
+        println!("🔍 ---------------- DEBUG START ----------------");
+        println!("Content being sent to AI:");
+        println!("{}", diff_content);
+        println!("🔍 ---------------- DEBUG END ------------------");
 
-            // Execute the update pipeline
-            if let Err(e) = process_changes(&client).await {
-                eprintln!("❌ Error processing changes: {:?}", e);
-            } else {
-                println!("✅ README updated successfully!");
-            }
-        }
-
-        // Sleep briefly to prevent high CPU usage in this poll loop
-        sleep(Duration::from_millis(100)).await;
+        send_to_llm_and_update_readme(&diff_content, cache);
+    } else {
+        println!("ℹ️  No actual changes detected after filtering.");
     }
 }
 
-async fn process_changes(client: &Client) -> Result<()> {
-    // 1. Run git diff
-    // We explicitly exclude README.md from the diff to prevent the AI from analyzing its own previous output.
-    let output = Command::new("git")
-        .args(["diff", ".", ":(exclude)README.md"]) 
-        .output()
-        .context("Failed to execute git diff")?;
+// I think there may still be a disconect between what is sent according to the debug printout and what the llm is summarizing
+#[tokio::main]
+async fn send_to_llm_and_update_readme(diff_content: &str, cache: &mut Cache) {
+    let client = reqwest::Client::new();
 
-    let diff_text = String::from_utf8_lossy(&output.stdout);
-
-    if diff_text.trim().is_empty() {
-        println!("🤷 No significant code changes found in diff.");
-        return Ok(());
-    }
-
-    println!("🧠 Sending diff ({} bytes) to Ollama...", diff_text.len());
-
-    // 2. Construct the Prompt
-    let system_prompt = "You are an automated technical writer maintaining a project's README. \
+    let prompt = format!(
+        "You are an automated technical writer maintaining a project's README. \
         You will receive a git diff of recent changes. \
         Your job is to write a concise, engaging log entry for these changes. \
         1. Use Markdown. \
         2. Use emojis to categorize changes (e.g., 🐛 for bugs, ✨ for features, ⚡ for perf). \
-        3. Include short code snippets in backticks ` ` if relevant. \
-        4. Do NOT write introductions like 'Here is the summary'. Just write the content.";
+        3. Include short code snippets in backticks ` `if relevant. \
+        4. Do NOT write introductions like 'Here is the summary'. Just write the content.\n\n\
+        Here is the diff:\n{}",
+        diff_content
+    );
 
-    let user_prompt = format!("Analyze this diff and write a summary entry:\n\n```diff\n{}\n```", diff_text);
+    let payload = serde_json::json!({
+        "model": "qwen2.5-coder:1.5b",
+        "prompt": prompt,
+        "stream": false,
+        "options": {
+            "num_ctx": 2048,
+            "temperature": 0.7,
+            "num_predict": 100
+        }
+    });
 
-    // 3. Call Ollama API
-    let request = ChatRequest {
-        model: MODEL_NAME.to_string(),
-        messages: vec![
-            ChatMessage { role: "system".to_string(), content: system_prompt.to_string() },
-            ChatMessage { role: "user".to_string(), content: user_prompt },
-        ],
-        stream: false,
-    };
+    println!(
+        "🧠 Sending diff ({} bytes) to Ollama...",
+        diff_content.len()
+    );
 
-    let res = client.post(OLLAMA_URL)
-        .json(&request)
+    match client
+        .post("http://localhost:11434/api/generate")
+        .json(&payload)
         .send()
         .await
-        .context("Failed to send request to Ollama")?;
-
-    if !res.status().is_success() {
-        let err_text = res.text().await?;
-        return Err(anyhow::anyhow!("Ollama API Error: {}", err_text));
+    {
+        Ok(response) => {
+            if let Ok(json) = response.json::<serde_json::Value>().await {
+                if let Some(message_content) = json["response"].as_str() {
+                    println!("🔍 LLM Response: {}", message_content);
+                    append_to_readme(message_content);
+                    cache.save();
+                    println!("✅ README updated successfully!");
+                } else {
+                    eprintln!("❌ Failed to parse LLM response");
+                }
+            }
+        }
+        Err(e) => eprintln!("❌ Failed to call Ollama: {}", e),
     }
+}
 
-    let chat_res: ChatResponse = res.json().await.context("Failed to parse Ollama response")?;
-    let generated_text = chat_res.message.content;
-
-    // 4. Update README.md
+fn append_to_readme(summary: &str) {
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let entry = format!("\n\n### 📅 Update: {}\n{}\n", timestamp, generated_text);
+    let entry = format!("### 📅 Update: {}\n{}\n", timestamp, summary.trim());
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("README.md")
-        .context("Failed to open README.md")?;
+    let readme_path = "README.md";
+    let existing_content = fs::read_to_string(readme_path).unwrap_or_default();
 
-    file.write_all(entry.as_bytes()).context("Failed to write to README.md")?;
+    let new_content = if existing_content.trim().is_empty() {
+        format!("# Project Updates\n\n{}", entry)
+    } else {
+        format!("{}\n{}", existing_content, entry)
+    };
 
+    fs::write(readme_path, new_content).expect("Failed to write to README.md");
     println!("✨ content appended to README.md");
-    Ok(())
+}
+
+fn main() {
+    // Initialize cache with current state (reset/rebase)
+    let mut cache = initialize_cache();
+
+    let (tx, rx) = channel();
+
+    let mut watcher: RecommendedWatcher =
+        Watcher::new(tx, Config::default()).expect("Failed to create watcher");
+
+    watcher
+        .watch(Path::new("."), RecursiveMode::Recursive)
+        .expect("Failed to watch directory");
+
+    println!("👀 Watching current directory...");
+
+    let mut pending_changes: HashSet<PathBuf> = HashSet::new();
+    let mut last_event_time = SystemTime::now();
+    let debounce_duration = Duration::from_secs(4);
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Ok(Event {
+                kind: EventKind::Modify(_) | EventKind::Create(_),
+                paths,
+                ..
+            })) => {
+                for path in paths {
+                    if !should_ignore(&path) && path.is_file() {
+                        println!("📝 Change detected: {:?}", path);
+                        pending_changes.insert(path);
+                        last_event_time = SystemTime::now();
+                    }
+                }
+            }
+            Ok(Err(e)) => eprintln!("❌ Watch error: {:?}", e),
+            Err(_) => {
+                // Timeout - check if debounce period has elapsed
+                if !pending_changes.is_empty() {
+                    if let Ok(elapsed) = last_event_time.elapsed() {
+                        if elapsed >= debounce_duration {
+                            println!("⏳ Debounce finished. Calculating diffs...");
+                            process_changes(&mut cache, &pending_changes);
+                            pending_changes.clear();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }

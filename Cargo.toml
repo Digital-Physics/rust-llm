@@ -8,7 +8,7 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 # For HTTP requests to Ollama
 # We use rustls-tls to avoid OpenSSL issues
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 # For file system watching
 notify = "6.1"
 # For JSON handling
