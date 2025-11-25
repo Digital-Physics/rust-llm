@@ -223,14 +223,24 @@ fn process_changes(cache: &mut Cache, paths: &HashSet<PathBuf>, processing: Arc<
 async fn send_to_llm_and_update_readme(diff_content: &str, cache: &mut Cache) {
     let client = reqwest::Client::new();
 
-    // Much simpler, more direct prompt. We may need to experiment with this.
+    // This is very detailed; we may want a simpler prompt.
     let prompt = format!(
-        "Summarize these code changes in 1-2 sentences with an emoji:\n\n{}",
+        "
+        You are an automated technical writer maintaining a project's README. \
+        You will receive a git diff of recent changes. \
+        Your job is to write a concise, engaging log entry for these changes. \
+        1. Use Markdown. \
+        2. Use emojis to categorize changes (e.g., 🐛 for bugs, ✨ for features, ⚡ for perf). \
+        3. Include short code snippets in backticks ` ` if relevant. \
+        4. Lines starting with '+'/'-' are added/removed lines of code.
+        5. Do NOT write introductions like 'Here is the summary'. Just write the content. 
+        \n\n{}",
         diff_content
     );
 
     let payload = serde_json::json!({
-        "model": "qwen2.5-coder:1.5b",
+        // "model": "qwen2.5-coder:1.5b", // this model had issues
+        "model": "qwen2.5-coder:7b", // this model performs better but slower (should test/quantify)
         "prompt": prompt,
         "stream": false,
         "context": [], //don't want previous conversation context
