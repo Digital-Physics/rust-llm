@@ -2,3 +2,4 @@ blueberries
 apples
 pears
 bananas * 75
+cheese whiz

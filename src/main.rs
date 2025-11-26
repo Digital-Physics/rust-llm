@@ -123,6 +123,7 @@ fn initialize_cache() -> Cache {
     cache
 }
 
+// going to need to track deleted files that don't get triggered by a save event
 fn calculate_diff(old_content: &str, new_content: &str) -> String {
     let old_lines: Vec<&str> = old_content.lines().collect();
     let new_lines: Vec<&str> = new_content.lines().collect();
@@ -202,10 +203,8 @@ fn process_changes(cache: &mut Cache, paths: &HashSet<PathBuf>, processing: Arc<
     }
 
     if !diff_content.trim().is_empty() {
-        println!("🔍 ---------------- DEBUG START ----------------");
-        println!("Content being sent to AI:");
+        println!("Content being sent to local LLM:");
         println!("{}", diff_content);
-        println!("🔍 ---------------- DEBUG END ------------------");
 
         send_to_llm_and_update_readme(&diff_content, cache);
     } else {
